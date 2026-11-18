@@ -2,7 +2,7 @@
 
 A simple todo app built with [GPUI](https://www.gpui.rs/), the GPU-accelerated UI framework from [Zed](https://zed.dev/).
 
-Todos are kept in memory only — they are lost when the app quits.
+Todos are kept in memory only — they are lost when the app quits, unless you enable the optional [end-to-end encrypted sync](#end-to-end-encrypted-sync).
 
 ## Features
 
@@ -61,3 +61,46 @@ src/
 ```
 
 `TextInput` emits a `Submit` event on <kbd>Enter</kbd>; `TodoApp` subscribes to it, adds the todo, and resets the input.
+
+## End-to-end encrypted sync
+
+Optionally, several app instances can share one todo list through a small sync server (`src/bin/server.rs`). The server is treated as untrusted: it only ever stores and returns ciphertext.
+
+The quickest way is the Makefile, which starts the server and two clients that share a vault:
+
+```sh
+make dev                                  # Ctrl-C, or closing both windows, stops everything
+make dev PASSPHRASE='my secret' VAULT=work
+```
+
+Or start each part yourself:
+
+```sh
+make server        # terminal 1: the server (in-memory, logs what it receives)
+make client        # terminals 2 and 3: clients using the same vault name and passphrase
+```
+
+`make help` lists all targets (`test`, `test-sync`, `lint`, …). Without make, run `cargo run --bin server` and `TODO_PASSPHRASE='…' cargo run`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TODO_PASSPHRASE` | (unset → local only) | Secret shared by your clients. Never sent to the server. |
+| `TODO_VAULT` | `default` | Vault name; part of the key derivation salt. |
+| `TODO_SYNC_URL` | `http://127.0.0.1:8787` | Server URL used by the clients. |
+| `TODO_SERVER_ADDR` | `127.0.0.1:8787` | Address the server binds to. |
+
+How it works (`src/crypto.rs`, `src/sync.rs`):
+
+- **Key derivation**: Argon2id(passphrase, salt = SHA-256(vault name)), then HKDF-SHA256 splits it into a 256-bit encryption key and a vault id. The server only learns the vault id.
+- **Encryption**: the whole list is serialized to JSON and sealed with XChaCha20-Poly1305 using a random 192-bit nonce. The vault id is bound as associated data, so a blob cannot be replayed into another vault, and any tampering fails decryption.
+- **Sync**: clients poll every second. Each todo carries an `updated_at` timestamp, and deletions are kept as tombstones, so concurrent edits are merged per item on the client (last writer wins). The server only does optimistic concurrency with `If-Match` / `X-Version`.
+
+Run `make test` for the unit tests, and `make test-sync` for a two-client round trip against a temporary server.
+
+Limitations of this experiment:
+
+- The server can still see metadata: vault id, blob size, and when clients write.
+- No protection against rollback: a malicious server could serve an older (still authentic) blob.
+- No key rotation or per-device keys; anyone with the passphrase has full access, and changing it starts a new, empty vault.
+- Last-writer-wins relies on client clocks.
+- The server keeps data in memory only and uses plain HTTP; put it behind TLS for anything beyond localhost.
